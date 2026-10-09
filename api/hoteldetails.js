@@ -1,25 +1,22 @@
 
 /*
-========================================================
-BOKKARA — HOTEL DETAILS BACKEND
+==========================================================
+BOKKARA — COMPLETE HOTEL DETAILS BACKEND
 File: api/hoteldetails.js
-========================================================
+==========================================================
 
-FEATURES
-- One Shopify-to-Vercel request
-- Google Hotels property details
-- Google Hotels photo gallery
-- Up to 50 guest reviews
-- Review pagination handled by backend
-- Room-specific photo extraction
-- Room gallery section matching
-- Normalized room and booking information
-- Existing Shopify frontend compatibility
-- No fabricated property or room data
+- One request from Shopify to Vercel
+- Hotel information and booking prices
+- Hotel and room-specific photos
+- Up to 50 reviews through server-side pagination
+- Reviewer profile pictures
+- Review photo URLs
+- Compatible hotel, gallery, reviews and pricing output
+- No fabricated images, rooms or reviews
 
-ENVIRONMENT VARIABLE
-SERPAPI_API_KEY=your_private_key
-========================================================
+Required Vercel environment variable:
+SERPAPI_API_KEY
+==========================================================
 */
 
 const SERPAPI_URL = "https://serpapi.com/search.json";
@@ -27,135 +24,159 @@ const TIMEOUT_MS = 25000;
 const MAX_REVIEWS = 50;
 const MAX_REVIEW_PAGES = 5;
 
-/* =====================================================
-   HELPERS
-===================================================== */
+/* ========================================================
+   UTILITIES
+======================================================== */
 
-function obj(v) {
-  return v && typeof v === "object" && !Array.isArray(v)
-    ? v
+function obj(value) {
+  return value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+    ? value
     : {};
 }
 
-function arr(v) {
-  return Array.isArray(v) ? v : [];
+function arr(value) {
+  return Array.isArray(value) ? value : [];
 }
 
 function first(...values) {
-  return values.find(
-    v => v !== undefined && v !== null && v !== ""
+  return values.find(value =>
+    value !== undefined &&
+    value !== null &&
+    value !== ""
   ) ?? null;
 }
 
-function str(v) {
-  return v === null ||
-    v === undefined ||
-    typeof v === "object"
+function str(value) {
+  return value == null ||
+    typeof value === "object"
     ? ""
-    : String(v).trim();
+    : String(value).trim();
 }
 
-function num(v) {
-  if (v === null || v === undefined || v === "") {
-    return null;
+function num(value) {
+  if (value == null || value === "") return null;
+
+  if (typeof value === "object") {
+    return num(first(
+      value.extracted_lowest,
+      value.extracted_price,
+      value.amount,
+      value.value
+    ));
   }
 
-  if (typeof v === "object") {
-    return num(
-      first(
-        v.extracted_lowest,
-        v.extracted_price,
-        v.amount,
-        v.value
-      )
-    );
-  }
-
-  const n = Number(
-    String(v).replace(/[^0-9.-]/g, "")
+  const parsed = Number(
+    String(value).replace(/[^0-9.-]/g, "")
   );
 
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-function url(v) {
-  const s = str(v);
-  return /^https?:\/\//i.test(s) ? s : "";
+function httpUrl(value) {
+  const candidate = str(value);
+  return /^https?:\/\//i.test(candidate)
+    ? candidate
+    : "";
 }
 
-function unique(items, key) {
+function imageUrl(value) {
+  if (typeof value === "string") {
+    return httpUrl(value);
+  }
+
+  const data = obj(value);
+
+  return httpUrl(first(
+    data.original_image,
+    data.image_url,
+    data.original,
+    data.url,
+    data.image,
+    data.src,
+    data.photo,
+    data.thumbnail,
+    data.avatar,
+    data.picture
+  ));
+}
+
+function unique(items, keyFn) {
   const seen = new Set();
 
   return items.filter(item => {
-    const k = key(item);
+    const key = keyFn(item);
 
-    if (!k || seen.has(k)) return false;
+    if (!key || seen.has(key)) return false;
 
-    seen.add(k);
+    seen.add(key);
     return true;
   });
 }
 
-function dateValue(v) {
-  const s = str(v);
+function integer(value, fallback, min, max) {
+  const parsed = Number(value);
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const d = new Date(s + "T00:00:00Z");
-
-    return !Number.isNaN(d.getTime()) &&
-      d.toISOString().slice(0, 10) === s
-      ? s
-      : "";
-  }
-
-  if (!s) return "";
-
-  const d = new Date(s);
-
-  return Number.isNaN(d.getTime())
-    ? ""
-    : d.toISOString().slice(0, 10);
-}
-
-function integer(v, fallback, min, max) {
-  const n = Number(v);
-
-  return Number.isInteger(n) &&
-    n >= min &&
-    n <= max
-    ? n
+  return Number.isInteger(parsed) &&
+    parsed >= min &&
+    parsed <= max
+    ? parsed
     : fallback;
 }
 
-function normalizeRate(v) {
-  const r = obj(v);
+function parseDate(value) {
+  const input = str(value);
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
+    const date = new Date(input + "T00:00:00Z");
+
+    return !Number.isNaN(date.getTime()) &&
+      date.toISOString().slice(0, 10) === input
+      ? input
+      : "";
+  }
+
+  if (!input) return "";
+
+  const date = new Date(input);
+
+  return Number.isNaN(date.getTime())
+    ? ""
+    : date.toISOString().slice(0, 10);
+}
+
+function normalizeRate(value) {
+  const data = obj(value);
 
   return {
-    display: str(
-      first(r.lowest, r.price, r.amount)
-    ),
+    display: str(first(
+      data.lowest,
+      data.price,
+      data.amount
+    )),
 
-    amount: num(
-      first(
-        r.extracted_lowest,
-        r.extracted_price,
-        r.amount
-      )
-    ),
+    amount: num(first(
+      data.extracted_lowest,
+      data.extracted_price,
+      data.amount
+    )),
 
-    before_taxes_fees: str(r.before_taxes_fees),
+    before_taxes_fees: str(
+      data.before_taxes_fees
+    ),
 
     before_taxes_fees_amount: num(
-      r.extracted_before_taxes_fees
+      data.extracted_before_taxes_fees
     ),
 
-    raw: r
+    raw: data
   };
 }
 
-/* =====================================================
-   SEARCH PARAMETERS
-===================================================== */
+/* ========================================================
+   QUERY PARAMETERS
+======================================================== */
 
 function getQuery(req) {
   const q = req.method === "POST"
@@ -167,35 +188,27 @@ function getQuery(req) {
   ).toUpperCase();
 
   return {
-    property_token: str(
-      first(
-        q.property_token,
-        q.propertyToken,
-        q.token
-      )
-    ),
+    property_token: str(first(
+      q.property_token,
+      q.propertyToken,
+      q.token
+    )),
 
-    destination: str(
-      first(
-        q.destination,
-        q.q,
-        q.location
-      )
-    ),
+    destination: str(first(
+      q.destination,
+      q.q,
+      q.location
+    )),
 
-    checkin: dateValue(
-      first(
-        q.checkin,
-        q.check_in_date
-      )
-    ),
+    checkin: parseDate(first(
+      q.checkin,
+      q.check_in_date
+    )),
 
-    checkout: dateValue(
-      first(
-        q.checkout,
-        q.check_out_date
-      )
-    ),
+    checkout: parseDate(first(
+      q.checkout,
+      q.check_out_date
+    )),
 
     rooms: integer(q.rooms, 1, 1, 10),
     adults: integer(q.adults, 2, 1, 40),
@@ -225,9 +238,7 @@ function validateQuery(q) {
   }
 
   if (!q.destination) {
-    throw new Error(
-      "Destination is required."
-    );
+    throw new Error("Destination is required.");
   }
 
   if (!q.checkin || !q.checkout) {
@@ -253,16 +264,14 @@ function validateQuery(q) {
         Number(age) > 17
       )
     ) {
-      throw new Error(
-        "Invalid children_ages."
-      );
+      throw new Error("Invalid children_ages.");
     }
   }
 }
 
-/* =====================================================
-   SERPAPI REQUEST
-===================================================== */
+/* ========================================================
+   SERPAPI
+======================================================== */
 
 async function callSerpApi(engine, params, apiKey) {
   const endpoint = new URL(SERPAPI_URL);
@@ -273,8 +282,8 @@ async function callSerpApi(engine, params, apiKey) {
 
   for (const [key, value] of Object.entries(params)) {
     if (
-      value !== null &&
       value !== undefined &&
+      value !== null &&
       value !== ""
     ) {
       endpoint.searchParams.set(
@@ -315,47 +324,37 @@ async function callSerpApi(engine, params, apiKey) {
   }
 }
 
-/* =====================================================
-   HOTEL PHOTOS
-===================================================== */
+/* ========================================================
+   PHOTO NORMALIZATION
+======================================================== */
 
-function normalizePhoto(v, section = "") {
-  const p = typeof v === "string"
-    ? { url: v }
-    : obj(v);
+function normalizePhoto(value, section = "") {
+  const data = typeof value === "string"
+    ? { url: value }
+    : obj(value);
 
-  const imageUrl = url(
-    first(
-      p.original_image,
-      p.image,
-      p.url,
-      p.src,
-      p.thumbnail
-    )
-  );
+  const url = imageUrl(data);
 
-  if (!imageUrl) return null;
+  if (!url) return null;
 
   return {
-    url: imageUrl,
+    url,
 
     original_image:
-      url(p.original_image) || imageUrl,
+      imageUrl(data.original_image) || url,
 
     thumbnail:
-      url(p.thumbnail) || imageUrl,
+      imageUrl(data.thumbnail) || url,
 
-    title: str(
-      first(
-        p.title,
-        p.caption,
-        p.description
-      )
-    ),
+    title: str(first(
+      data.title,
+      data.caption,
+      data.description
+    )),
 
     section,
 
-    raw: p
+    raw: data
   };
 }
 
@@ -372,91 +371,87 @@ function photoItems(value, section = "") {
 }
 
 function normalizePhotos(data) {
-  const d = obj(data);
+  const source = obj(data);
 
-  const sections = arr(d.sections).map(section => {
-    const s = obj(section);
-    const title = str(s.title);
+  const sections = arr(source.sections).map(value => {
+    const section = obj(value);
+    const title = str(section.title);
 
     return {
       title,
 
-      total: num(s.total),
+      total: num(section.total),
 
       photos: photoItems(
-        first(s.photos, s.images),
+        first(section.photos, section.images),
         title
       ),
 
       next_page_token:
-        str(s.next_page_token) || null,
+        str(section.next_page_token) || null,
 
-      raw: s
+      raw: section
     };
   });
 
-  const topPhotos = photoItems(
-    first(d.photos, d.images)
-  );
-
   const photos = unique(
     [
-      ...topPhotos,
-      ...sections.flatMap(s => s.photos)
+      ...photoItems(first(
+        source.photos,
+        source.images
+      )),
+
+      ...sections.flatMap(
+        section => section.photos
+      )
     ],
-    p => p.url
+    photo => photo.url
   );
 
   return {
     sections,
     photos,
-    photo_urls: photos.map(p => p.url),
+    photo_urls: photos.map(photo => photo.url),
     photo_count_loaded: photos.length,
 
     has_more_photos: sections.some(
-      s => Boolean(s.next_page_token)
+      section => Boolean(section.next_page_token)
     )
   };
 }
 
-/* =====================================================
-   ROOM PHOTOS
-===================================================== */
+/* ========================================================
+   ROOM PHOTOGRAPHS
+======================================================== */
 
-function roomName(room) {
-  const r = obj(room);
+function roomName(value) {
+  const room = obj(value);
 
-  return str(
-    first(
-      r.name,
-      r.room_name,
-      r.title,
-      r.type
-    )
-  );
+  return str(first(
+    room.name,
+    room.room_name,
+    room.title,
+    room.type
+  ));
 }
 
-function normalizeRoom(room, sections = []) {
-  const r = obj(room);
-  const name = roomName(r);
+function normalizeRoom(value, sections = []) {
+  const room = obj(value);
+  const name = roomName(room);
 
   const directPhotos = [
-    ...photoItems(r.images),
-    ...photoItems(r.photos),
-    ...photoItems(r.room_images),
-    ...photoItems(r.room_photos),
-    ...photoItems(r.image),
-    ...photoItems(r.thumbnail),
-    ...photoItems(r.photo)
+    ...photoItems(room.images),
+    ...photoItems(room.photos),
+    ...photoItems(room.room_images),
+    ...photoItems(room.room_photos),
+    ...photoItems(room.image),
+    ...photoItems(room.thumbnail),
+    ...photoItems(room.photo)
   ];
 
-  /*
-    Match gallery sections only when their labels
-    explicitly correspond to this room type.
-    Do not substitute general property photos.
-  */
-
-  const roomSections = sections.filter(section => {
+  // Match only gallery sections explicitly named
+  // after the room. Never use unrelated hotel photos.
+  const matchingSections = sections.filter(section => {
     const title = str(
       section.title
     ).toLowerCase().trim();
@@ -477,23 +472,22 @@ function normalizeRoom(room, sections = []) {
   const images = unique(
     [
       ...directPhotos,
-      ...roomSections.flatMap(
+
+      ...matchingSections.flatMap(
         section => arr(section.photos)
       )
     ],
-    image => image.url
+    photo => photo.url
   );
 
   return {
-    ...r,
+    ...room,
 
     name,
 
     images,
 
-    photos: images.map(
-      image => image.url
-    ),
+    photos: images.map(photo => photo.url),
 
     image: images[0]?.url || "",
 
@@ -502,8 +496,7 @@ function normalizeRoom(room, sections = []) {
 
     image_count: images.length,
 
-    has_room_photos:
-      images.length > 0
+    has_room_photos: images.length > 0
   };
 }
 
@@ -516,6 +509,9 @@ function attachRoomImages(hotel, gallery) {
     normalizeRoom(room, sections)
   );
 
+  const featuredCount =
+    hotel.featured_prices.length;
+
   hotel.booking_options = arr(
     hotel.booking_options
   ).map(option => ({
@@ -525,9 +521,6 @@ function attachRoomImages(hotel, gallery) {
       room => normalizeRoom(room, sections)
     )
   }));
-
-  const featuredCount =
-    hotel.featured_prices.length;
 
   hotel.featured_prices =
     hotel.booking_options.slice(
@@ -541,62 +534,57 @@ function attachRoomImages(hotel, gallery) {
     );
 }
 
-/* =====================================================
+/* ========================================================
    BOOKING OPTIONS
-===================================================== */
+======================================================== */
 
 function normalizeBookingOption(value) {
-  const o = obj(value);
+  const option = obj(value);
 
   return {
-    source: str(
-      first(o.source, o.name)
-    ),
+    source: str(first(
+      option.source,
+      option.name
+    )),
 
-    link: url(o.link),
+    link: httpUrl(option.link),
+    logo: httpUrl(option.logo),
 
-    logo: url(o.logo),
-
-    num_guests: num(o.num_guests),
+    num_guests: num(option.num_guests),
 
     rate_per_night: normalizeRate(
-      o.rate_per_night
+      option.rate_per_night
     ),
 
     total_rate: normalizeRate(
-      o.total_rate
+      option.total_rate
     ),
 
-    rooms: arr(o.rooms),
+    rooms: arr(option.rooms),
 
     benefits: first(
-      o.benefits,
+      option.benefits,
       null
     ),
 
-    raw: o
+    raw: option
   };
 }
 
-/* =====================================================
-   PROPERTY NORMALIZATION
-===================================================== */
+/* ========================================================
+   HOTEL PROPERTY
+======================================================== */
 
 function normalizeProperty(data, q) {
   const p = obj(data);
+  const gps = obj(p.gps_coordinates);
 
-  const gps = obj(
-    p.gps_coordinates
-  );
-
-  const address = str(
-    first(
-      p.address,
-      p.formatted_address,
-      p.full_address,
-      p.street_address
-    )
-  );
+  const address = str(first(
+    p.address,
+    p.formatted_address,
+    p.full_address,
+    p.street_address
+  ));
 
   const featured = arr(
     p.featured_prices
@@ -614,13 +602,11 @@ function normalizeProperty(data, q) {
     p.total_rate
   );
 
-  const rating = num(
-    first(
-      p.overall_rating,
-      p.rating,
-      p.guest_rating
-    )
-  );
+  const rating = num(first(
+    p.overall_rating,
+    p.rating,
+    p.guest_rating
+  ));
 
   const nights = Math.round(
     (
@@ -630,19 +616,17 @@ function normalizeProperty(data, q) {
   );
 
   return {
-    property_token: str(
-      first(
-        p.property_token,
-        q.property_token
-      )
-    ),
+    property_token: str(first(
+      p.property_token,
+      q.property_token
+    )),
 
     name: str(p.name),
     type: str(p.type),
     description: str(p.description),
 
-    website: url(p.link),
-    logo: url(p.logo),
+    website: httpUrl(p.link),
+    logo: httpUrl(p.logo),
 
     address,
     address_available: Boolean(address),
@@ -659,33 +643,26 @@ function normalizeProperty(data, q) {
     check_in_time: str(p.check_in_time),
     check_out_time: str(p.check_out_time),
 
-    stars: num(
-      first(
-        p.extracted_hotel_class,
-        p.hotel_class,
-        p.stars
-      )
-    ),
+    stars: num(first(
+      p.extracted_hotel_class,
+      p.hotel_class,
+      p.stars
+    )),
 
     hotel_class: str(p.hotel_class),
 
     rating,
 
-    rating_display:
-      rating === null
-        ? null
-        : rating.toFixed(1),
+    rating_display: rating === null
+      ? null
+      : rating.toFixed(1),
 
-    review_count: num(
-      first(
-        p.reviews,
-        p.review_count
-      )
-    ),
+    review_count: num(first(
+      p.reviews,
+      p.review_count
+    )),
 
-    location_rating: num(
-      p.location_rating
-    ),
+    location_rating: num(p.location_rating),
 
     reviews_breakdown:
       first(p.reviews_breakdown, null),
@@ -704,8 +681,7 @@ function normalizeProperty(data, q) {
     essential_info:
       first(p.essential_info, null),
 
-    nearby_places:
-      arr(p.nearby_places),
+    nearby_places: arr(p.nearby_places),
 
     eco_certified:
       p.eco_certified === true,
@@ -739,42 +715,157 @@ function normalizeProperty(data, q) {
 
     images: arr(p.images),
 
-    thumbnail: url(p.thumbnail),
+    thumbnail: httpUrl(p.thumbnail),
 
     raw: p
   };
 }
 
-/* =====================================================
-   GUEST REVIEWS
-===================================================== */
+/* ========================================================
+   REVIEWER PROFILE PHOTOS
+======================================================== */
+
+function normalizeReviewerPhoto(review) {
+  const r = obj(review);
+
+  const user = obj(r.user);
+  const author = obj(r.author);
+  const reviewer = obj(r.reviewer);
+  const profile = obj(r.profile);
+
+  const candidates = [
+    user.thumbnail,
+    user.image,
+    user.photo,
+    user.avatar,
+    user.profile_photo,
+    user.profile_picture,
+    user.picture,
+
+    author.thumbnail,
+    author.image,
+    author.photo,
+    author.avatar,
+    author.profile_picture,
+
+    reviewer.thumbnail,
+    reviewer.image,
+    reviewer.photo,
+    reviewer.avatar,
+
+    profile.thumbnail,
+    profile.image,
+    profile.photo,
+
+    r.user_thumbnail,
+    r.user_image,
+    r.author_photo,
+    r.author_image,
+    r.reviewer_photo,
+    r.reviewer_image,
+    r.profile_photo,
+    r.profile_image,
+    r.avatar
+  ];
+
+  for (const candidate of candidates) {
+    const image = imageUrl(candidate);
+
+    if (image) return image;
+  }
+
+  return "";
+}
+
+/* ========================================================
+   REVIEW PHOTO NORMALIZATION
+======================================================== */
+
+function normalizeReviewPhotos(review) {
+  const r = obj(review);
+
+  const images = [
+    ...photoItems(r.images),
+    ...photoItems(r.photos),
+    ...photoItems(r.review_images),
+    ...photoItems(r.review_photos)
+  ];
+
+  return unique(
+    images,
+    image => image.url
+  );
+}
+
+/* ========================================================
+   GUEST REVIEW NORMALIZATION
+======================================================== */
 
 function normalizeReview(value) {
   const r = obj(value);
+
   const user = obj(r.user);
+  const author = obj(r.author);
+  const reviewer = obj(r.reviewer);
+
+  const authorName = str(first(
+    user.name,
+    author.name,
+    reviewer.name,
+    r.author_name,
+    r.reviewer_name,
+    typeof r.author === "string"
+      ? r.author
+      : null
+  ));
+
+  const authorPhoto =
+    normalizeReviewerPhoto(r);
+
+  const reviewPhotos =
+    normalizeReviewPhotos(r);
 
   return {
-    author: str(
-      first(
-        user.name,
-        r.author
-      )
-    ),
+    author: authorName,
 
-    author_url: url(user.link),
+    author_name: authorName,
 
-    author_photo: url(
-      first(
-        user.thumbnail,
-        user.image
-      )
-    ),
+    author_url: httpUrl(first(
+      user.link,
+      author.link,
+      reviewer.link,
+      r.author_url
+    )),
+
+    // Primary field used by Shopify
+    author_photo: authorPhoto,
+
+    // Additional frontend-compatible fields
+    author_image: authorPhoto,
+    user_photo: authorPhoto,
+    profile_image: authorPhoto,
+    reviewer_photo: authorPhoto,
+    reviewer_image: authorPhoto,
+    avatar: authorPhoto,
+
+    has_author_photo:
+      Boolean(authorPhoto),
+
+    user: {
+      ...user,
+
+      name: authorName,
+
+      thumbnail: authorPhoto,
+      image: authorPhoto,
+      photo: authorPhoto,
+      avatar: authorPhoto
+    },
 
     source: str(r.source),
 
-    source_icon: url(
-      r.source_icon
-    ),
+    source_icon:
+      httpUrl(r.source_icon),
 
     rating: num(r.rating),
 
@@ -784,16 +875,22 @@ function normalizeReview(value) {
 
     date: str(r.date),
 
-    text: str(
-      first(
-        r.snippet,
-        r.text
-      )
+    text: str(first(
+      r.snippet,
+      r.text
+    )),
+
+    link: httpUrl(r.link),
+
+    // Guest-uploaded review photographs
+    images: reviewPhotos.map(
+      photo => photo.url
     ),
 
-    link: url(r.link),
+    photos: reviewPhotos,
 
-    images: arr(r.images),
+    has_review_photos:
+      reviewPhotos.length > 0,
 
     subratings:
       first(r.subratings, null),
@@ -801,12 +898,11 @@ function normalizeReview(value) {
     hotel_highlights:
       arr(r.hotel_highlights),
 
-    review_details:
-      first(
-        r.details,
-        r.review_details,
-        null
-      ),
+    review_details: first(
+      r.details,
+      r.review_details,
+      null
+    ),
 
     raw: r
   };
@@ -825,13 +921,11 @@ function normalizeReviews(data) {
     review_count_loaded:
       reviews.length,
 
-    next_page_token: str(
-      first(
-        obj(d.serpapi_pagination).next_page_token,
-        obj(d.pagination).next_page_token,
-        d.next_page_token
-      )
-    ) || null,
+    next_page_token: str(first(
+      obj(d.serpapi_pagination).next_page_token,
+      obj(d.pagination).next_page_token,
+      d.next_page_token
+    )) || null,
 
     pagination: first(
       d.serpapi_pagination,
@@ -841,13 +935,13 @@ function normalizeReviews(data) {
   };
 }
 
-/* =====================================================
+/* ========================================================
    FETCH UP TO 50 REVIEWS
-===================================================== */
+======================================================== */
 
 async function collectReviews(
   initialData,
-  reviewParams,
+  params,
   apiKey
 ) {
   const initial = normalizeReviews(
@@ -858,18 +952,16 @@ async function collectReviews(
     ...initial.reviews
   ];
 
-  const pages = [
-    initialData
-  ];
-
-  const errors = [];
   const seenTokens = new Set();
 
   let nextToken =
     initial.next_page_token;
 
+  let pagesLoaded = 1;
   let requestsAttempted = 0;
   let requestsSucceeded = 0;
+
+  const errors = [];
 
   for (
     let page = 1;
@@ -878,31 +970,27 @@ async function collectReviews(
     nextToken;
     page++
   ) {
-    if (seenTokens.has(nextToken)) {
-      break;
-    }
+    if (seenTokens.has(nextToken)) break;
 
     seenTokens.add(nextToken);
-
     requestsAttempted++;
 
     try {
       const nextData = await callSerpApi(
         "google_hotels_reviews",
         {
-          ...reviewParams,
+          ...params,
           next_page_token: nextToken
         },
         apiKey
       );
 
       requestsSucceeded++;
+      pagesLoaded++;
 
       const parsed = normalizeReviews(
         nextData
       );
-
-      pages.push(nextData);
 
       collected.push(
         ...parsed.reviews
@@ -911,14 +999,12 @@ async function collectReviews(
       nextToken =
         parsed.next_page_token;
 
-      if (!parsed.reviews.length) {
-        break;
-      }
+      if (!parsed.reviews.length) break;
 
     } catch (error) {
       errors.push(
         error.message ||
-        "Unable to load another review page."
+        "Unable to load additional reviews."
       );
 
       break;
@@ -941,9 +1027,11 @@ async function collectReviews(
     review_count_loaded:
       reviews.length,
 
-    next_page_token: nextToken,
+    next_page_token:
+      nextToken,
 
-    pages_loaded: pages.length,
+    pages_loaded:
+      pagesLoaded,
 
     requests_attempted:
       requestsAttempted,
@@ -955,9 +1043,9 @@ async function collectReviews(
   };
 }
 
-/* =====================================================
-   CLEAN RAW SOURCE
-===================================================== */
+/* ========================================================
+   CLEAN RAW RESPONSE
+======================================================== */
 
 function cleanRaw(data) {
   return Object.fromEntries(
@@ -971,9 +1059,9 @@ function cleanRaw(data) {
   );
 }
 
-/* =====================================================
-   MAIN VERCEL HANDLER
-===================================================== */
+/* ========================================================
+   MAIN VERCEL API HANDLER
+======================================================== */
 
 export default async function handler(req, res) {
 
@@ -1036,9 +1124,7 @@ export default async function handler(req, res) {
     });
   }
 
-  /* ---------------------------------------------
-     PROPERTY SEARCH
-  --------------------------------------------- */
+  /* PROPERTY REQUEST */
 
   const propertyParams = {
     property_token: q.property_token,
@@ -1065,18 +1151,14 @@ export default async function handler(req, res) {
       q.children_ages;
   }
 
-  /* ---------------------------------------------
-     PHOTO SEARCH
-  --------------------------------------------- */
+  /* PHOTO REQUEST */
 
   const photoParams = {
     property_token: q.property_token,
     hl: q.hl
   };
 
-  /* ---------------------------------------------
-     REVIEW SEARCH
-  --------------------------------------------- */
+  /* REVIEW REQUEST */
 
   const reviewParams = {
     property_token: q.property_token,
@@ -1084,9 +1166,7 @@ export default async function handler(req, res) {
     sort_by: 1
   };
 
-  /* ---------------------------------------------
-     THREE INITIAL PARALLEL REQUESTS
-  --------------------------------------------- */
+  /* THREE CONCURRENT INITIAL REQUESTS */
 
   const engines = [
     "google_hotels",
@@ -1117,11 +1197,7 @@ export default async function handler(req, res) {
   const status = {};
   const data = {};
 
-  for (
-    let i = 0;
-    i < engines.length;
-    i++
-  ) {
+  for (let i = 0; i < engines.length; i++) {
     const engine = engines[i];
     const result = settled[i];
 
@@ -1146,9 +1222,7 @@ export default async function handler(req, res) {
     }
   }
 
-  /* ---------------------------------------------
-     PROPERTY RESPONSE REQUIRED
-  --------------------------------------------- */
+  /* HOTEL DETAILS MUST SUCCEED */
 
   if (!status.google_hotels.success) {
     return res.status(502).json({
@@ -1181,27 +1255,27 @@ export default async function handler(req, res) {
     });
   }
 
-  /* ---------------------------------------------
-     NORMALIZE PROPERTY AND PHOTOS
-  --------------------------------------------- */
+  /* NORMALIZE HOTEL */
 
   const hotel = normalizeProperty(
     propertyData,
     q
   );
 
+  /* NORMALIZE PHOTO GALLERY */
+
   const gallery = normalizePhotos(
     data.google_hotels_photos
   );
+
+  /* ATTACH ROOM-SPECIFIC IMAGES */
 
   attachRoomImages(
     hotel,
     gallery
   );
 
-  /* ---------------------------------------------
-     COLLECT REVIEWS
-  --------------------------------------------- */
+  /* RETRIEVE REVIEWS */
 
   let reviewData = {
     reviews: [],
@@ -1213,7 +1287,9 @@ export default async function handler(req, res) {
     errors: []
   };
 
-  if (status.google_hotels_reviews.success) {
+  if (
+    status.google_hotels_reviews.success
+  ) {
     reviewData = await collectReviews(
       data.google_hotels_reviews,
       reviewParams,
@@ -1221,9 +1297,7 @@ export default async function handler(req, res) {
     );
   }
 
-  /* ---------------------------------------------
-     COMBINE PROPERTY PHOTOS
-  --------------------------------------------- */
+  /* COMBINE HOTEL PHOTOGRAPHS */
 
   const propertyImages = photoItems(
     propertyData.images,
@@ -1254,18 +1328,25 @@ export default async function handler(req, res) {
     photo => photo.url
   );
 
-  /* ---------------------------------------------
-     FINAL RESPONSE
-  --------------------------------------------- */
+  /* REQUEST STATISTICS */
 
-  const totalAttempts =
+  const requestsAttempted =
     3 + reviewData.requests_attempted;
 
-  const totalSucceeded =
+  const requestsSucceeded =
     Object.values(status).filter(
-      s => s.success
+      value => value.success
     ).length +
     reviewData.requests_succeeded;
+
+  const reviewerPhotosLoaded =
+    reviewData.reviews.filter(
+      review => review.has_author_photo
+    ).length;
+
+  /* =====================================================
+     FINAL SHOPIFY RESPONSE
+  ===================================================== */
 
   return res.status(200).json({
 
@@ -1312,7 +1393,7 @@ export default async function handler(req, res) {
         reviewData.next_page_token
     },
 
-    /* GALLERY */
+    /* PHOTO GALLERY */
 
     gallery: {
       photos: allPhotos,
@@ -1331,7 +1412,7 @@ export default async function handler(req, res) {
         gallery.has_more_photos
     },
 
-    /* REVIEWS */
+    /* GUEST REVIEWS */
 
     reviews: {
       items: reviewData.reviews,
@@ -1354,10 +1435,13 @@ export default async function handler(req, res) {
         reviewData.next_page_token,
 
       pages_loaded:
-        reviewData.pages_loaded
+        reviewData.pages_loaded,
+
+      reviewer_photos_loaded:
+        reviewerPhotosLoaded
     },
 
-    /* PRICING */
+    /* PRICING AND ROOMS */
 
     pricing: {
       currency: hotel.currency,
@@ -1383,38 +1467,24 @@ export default async function handler(req, res) {
         hotel.room_options
     },
 
-    /* SEARCH */
+    /* SEARCH INFORMATION */
 
     search: {
-      destination:
-        q.destination,
+      destination: q.destination,
 
-      checkin:
-        q.checkin,
+      checkin: q.checkin,
+      checkout: q.checkout,
 
-      checkout:
-        q.checkout,
+      rooms: q.rooms,
+      adults: q.adults,
+      children: q.children,
+      babies: q.babies,
+      seniors: q.seniors,
 
-      rooms:
-        q.rooms,
-
-      adults:
-        q.adults,
-
-      children:
-        q.children,
-
-      babies:
-        q.babies,
-
-      seniors:
-        q.seniors,
-
-      currency:
-        q.currency
+      currency: q.currency
     },
 
-    /* ORIGINAL SOURCE DATA */
+    /* ORIGINAL API DATA */
 
     raw: {
       property: cleanRaw(
@@ -1433,7 +1503,7 @@ export default async function handler(req, res) {
         reviewData.pages_loaded
     },
 
-    /* METADATA */
+    /* DEBUGGING INFORMATION */
 
     meta: {
       source:
@@ -1442,13 +1512,16 @@ export default async function handler(req, res) {
       frontend_requests_required: 1,
 
       serpapi_requests_attempted:
-        totalAttempts,
+        requestsAttempted,
 
       serpapi_requests_succeeded:
-        totalSucceeded,
+        requestsSucceeded,
 
       review_pages_loaded:
         reviewData.pages_loaded,
+
+      reviewer_photos_loaded:
+        reviewerPhotosLoaded,
 
       review_pagination_errors:
         reviewData.errors,
@@ -1464,14 +1537,17 @@ export default async function handler(req, res) {
       has_reviews:
         reviewData.reviews.length > 0,
 
+      has_reviewer_photos:
+        reviewerPhotosLoaded > 0,
+
       room_photos_available:
         hotel.room_options.some(
-          r => r.has_room_photos
+          room => room.has_room_photos
         ) ||
         hotel.booking_options.some(
           option =>
             option.rooms.some(
-              r => r.has_room_photos
+              room => room.has_room_photos
             )
         ),
 
